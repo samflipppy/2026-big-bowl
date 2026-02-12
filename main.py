@@ -1,57 +1,59 @@
 #!/usr/bin/env python3
 """
 =================================================================
-Coverage Shell Deception: Detecting & Quantifying Defensive
-Disguise Using NFL Ball-in-Air Tracking Data
+Distance Lies, Direction Doesn't:
+How Closing Angle Predicts Ball-in-Air Outcomes
 =================================================================
 
 NFL Big Data Bowl 2026 — Analytics Submission
 
-Author: [Your Name]
 Data: NFL Next Gen Stats tracking data, 2023-2024 seasons
       14,108 pass plays | 272 games | 1,384 players
 
-SUMMARY
--------
-This project detects and quantifies coverage disguise — when defenses
-show one coverage shell pre-throw but execute a different scheme once
-the ball is in the air.
-
-Using a Random Forest model (80% AUC) trained on 43 engineered features,
-we identify the key pre-throw signals that predict disguise and produce:
-
-  - A Disguise Score metric per game/team
-  - A Safety Deception Score per player
-  - Coaching-actionable insights on when and how disguise occurs
+KEY INSIGHT
+-----------
+A defender 5 yards from the catch point heading sideways ends up
+FURTHER from the ball at the catch than one 12 yards away heading
+straight at it. Above a 60-degree closing angle, defenders move
+AWAY from the ball during flight — not toward it.
 
 KEY FINDINGS
 ------------
-1. 17.6% of pass plays show coverage disguise
-2. Safety minimum depth from LOS is the #1 predictor of disguise
-3. 1-high shells disguise at 2x the rate of 2-high shells (31% vs 15%)
-4. Safeties within 3 yards of the hash disguise at 23.5% vs 13.1%
-5. Disguise does NOT hurt pursuit efficiency — disguising safeties
-   actually close MORE distance on the ball (5.3 yds vs 3.4 yds)
+1. The 60-degree threshold: defenders with a closing angle above 60
+   degrees have NEGATIVE closure — they drift further from the catch
+   point during ball flight
+2. 27% of nearest defenders at the throw are heading the wrong way
+3. A defender 12+ yds away on a beeline (end: ~4 yds) beats a
+   defender 0-5 yds away at 90+ degrees (end: ~6 yds)
+4. LBs are caught going the wrong way far more often than CBs
+5. At the same starting distance (5-8 yds), CBs close ~2x more
+   often than LBs — speed and hip fluidity are the mechanism
+6. The defender's direction at throw release predicts their flight
+   closing angle — the QB CAN read this pre-throw
 
 METHODOLOGY
 -----------
-Follows the Dom Borsani approach: interpretable, feature-driven,
-coach-relevant, actionable.
+Interpretable, feature-driven, coach-relevant, actionable.
+Follows the Dom Borsani philosophy.
 
-  - Random Forest with OOB validation (not deep learning)
-  - Variable importance as the primary insight mechanism
-  - Focus on safeties as the key rotation players
-  - Geometric rotation detection (not hand-labeled)
+  - Geometric closing angle computation from ball-in-air tracking
+  - Distance x Angle interaction analysis
+  - Position-specific closing ability comparison
+  - Pre-throw predictors of closing angle (QB-readable)
+  - Random Forest model for coverage disguise detection
 
 PIPELINE
 --------
-  01_data_prep.py          → Load, standardize, identify positions
-  02_shell_classification.py → Classify defensive shells (1/2/0-high)
-  03_feature_engineering.py  → 43 features: structure, deltas, pursuit
-  04_disguise_model.py       → Random Forest + variable importance
-  05_metrics_and_rankings.py → Disguise Score, Safety Deception Score
-  06_visualizations.py       → Field plots, leaderboards, distributions
-  07_insights.py             → Coaching report and actionable findings
+  01_data_prep.py           -> Load, standardize, identify positions
+  02_shell_classification.py -> Classify defensive shells (1/2/0-high)
+  03_feature_engineering.py  -> 43 features: structure, deltas, pursuit
+  04_disguise_model.py       -> Random Forest + variable importance
+  05_metrics_and_rankings.py -> Disguise Score, Safety Deception Score
+  06_visualizations.py       -> Field plots, leaderboards, distributions
+  07_insights.py             -> Coaching report and actionable findings
+  08_qb_reads.py             -> QB pre-snap read analysis
+  09_closing_angle.py        -> THE CLOSING ANGLE THESIS (core analysis)
+  10_closing_visuals.py      -> Closing angle visualizations
 
 USAGE
 -----
@@ -59,7 +61,6 @@ USAGE
 """
 
 import os
-import sys
 import time
 
 # Ensure we're in the project root
@@ -73,7 +74,6 @@ def run_step(step_name, module_path):
     print(f"{'='*60}")
     start = time.time()
 
-    # Import and run the module's main block
     import importlib.util
     spec = importlib.util.spec_from_file_location("step", module_path)
     mod = importlib.util.module_from_spec(spec)
@@ -86,8 +86,8 @@ def run_step(step_name, module_path):
 def main():
     print("""
     ╔══════════════════════════════════════════════════════════╗
-    ║  Coverage Shell Deception: Detecting & Quantifying      ║
-    ║  Defensive Disguise Using Ball-in-Air Tracking Data     ║
+    ║  Distance Lies, Direction Doesn't                       ║
+    ║  How Closing Angle Predicts Ball-in-Air Outcomes        ║
     ║                                                         ║
     ║  NFL Big Data Bowl 2026 — Analytics Track               ║
     ╚══════════════════════════════════════════════════════════╝
@@ -103,6 +103,9 @@ def main():
         ("Metrics & Rankings", "src/05_metrics_and_rankings.py"),
         ("Visualizations", "src/06_visualizations.py"),
         ("Insights & Report", "src/07_insights.py"),
+        ("QB Reads", "src/08_qb_reads.py"),
+        ("Closing Angle Thesis", "src/09_closing_angle.py"),
+        ("Closing Angle Visuals", "src/10_closing_visuals.py"),
     ]
 
     for name, path in steps:
@@ -116,10 +119,14 @@ def main():
     print(f"    Figures:  output/figures/")
     print(f"    Data:     data/*.pkl")
     print(f"\n  Key files:")
+    print(f"    Closing angle data:  data/closing_angle.pkl")
     print(f"    Model predictions:   data/model_predictions.pkl")
-    print(f"    Feature importance:   data/feature_importance.pkl")
+    print(f"    Feature importance:  data/feature_importance.pkl")
     print(f"    Safety rankings:     data/safety_stats.pkl")
-    print(f"    Game rankings:       data/game_metrics.pkl")
+    print(f"\n  Key insight:")
+    print(f"    'Distance lies, direction doesn't.'")
+    print(f"    A defender >60 degrees off the catch point drifts")
+    print(f"    FURTHER during ball flight, not closer.")
 
 
 if __name__ == "__main__":
