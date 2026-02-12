@@ -1,468 +1,450 @@
 """
 Step 8: QB Pre-Snap Read Analysis
 ===================================
-Flip the perspective: what can a quarterback learn from pre-snap
-safety alignment to detect when the defense is lying?
+Concrete, actionable insights for a quarterback reading the defense.
 
-This is the offensive game-planning application of disguise detection.
+Three core analyses:
+  1. MATCHUP PREDICTION — Who is covering my target and can I tell pre-snap?
+  2. THROW WINDOW PREDICTION — What does the pre-snap alignment tell me
+     about how open my target will be?
+  3. MISMATCH EXPLOITATION — Which matchup types give the biggest windows?
 
-KEY CONCEPT: A QB has ~2-3 seconds pre-snap to read the defense.
-The question is: which reads are "trustworthy" vs "suspicious"?
-
-We produce:
-  1. A QB Read Decision Tree (which looks to trust vs question)
-  2. Timing analysis (how early can you detect rotation)
-  3. A "Deception Alert" heat map by safety alignment
-  4. Specific reads by shell type
+These are the reads that belong in a QB game-plan binder.
 """
 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from matplotlib.colors import LinearSegmentedColormap
 import seaborn as sns
 
 
-def build_qb_read_features(input_df, frame_refs, labels, shells):
-    """
-    Build the feature set a QB would conceptually "see" pre-snap.
-    Everything here is observable from the QB's perspective at the line.
-    """
-    safety_df = input_df[input_df["is_safety"]].copy()
-    snap_safety = safety_df[safety_df["frame_id"] == 1].copy()
-
-    play_reads = snap_safety.groupby(["game_id", "play_id"]).agg(
-        n_safeties=("nfl_id", "count"),
-        depth_min=("depth_from_los", "min"),
-        depth_max=("depth_from_los", "max"),
-        depth_mean=("depth_from_los", "mean"),
-        depth_spread=("depth_from_los", lambda x: x.max() - x.min()),
-        width_spread=("width_from_center", lambda x: x.max() - x.min()),
-        width_mean_abs=("width_from_center", lambda x: x.abs().mean()),
-        n_near_hash=("width_from_center", lambda x: (x.abs() < 3).sum()),
-        n_shallow=("depth_from_los", lambda x: (x < 8).sum()),
-        n_deep=("depth_from_los", lambda x: (x >= 8).sum()),
-        speed_max=("s", "max"),
-        speed_mean=("s", "mean"),
-    ).reset_index()
-
-    # Snap shell classification
-    play_reads["snap_shell"] = "0-high"
-    play_reads.loc[play_reads["n_deep"] == 1, "snap_shell"] = "1-high"
-    play_reads.loc[play_reads["n_deep"] >= 2, "snap_shell"] = "2-high"
-
-    # QB-visible reads (binary flags)
-    play_reads["one_shallow_one_deep"] = (
-        (play_reads["n_shallow"] >= 1) & (play_reads["n_deep"] >= 1)
-        & (play_reads["depth_spread"] > 3)
+def detect_snap_frames(input_df):
+    """Detect snap frame per play from WR acceleration."""
+    offense = input_df[input_df["player_side"] == "Offense"]
+    wr_speed = offense[offense["player_role"].isin(["Other Route Runner", "Targeted Receiver"])]
+    avg_speed = wr_speed.groupby(["game_id", "play_id", "frame_id"])["s"].mean().reset_index()
+    snap_frames = (
+        avg_speed[avg_speed["s"] > 0.5]
+        .groupby(["game_id", "play_id"])["frame_id"]
+        .min()
+        .reset_index()
     )
-    play_reads["both_near_hash"] = play_reads["n_near_hash"] >= 2
-    play_reads["stacked"] = (
-        (play_reads["depth_spread"] > 4) & (play_reads["width_spread"] < 10)
-    )
-    play_reads["honest_2high"] = (
-        (play_reads["n_shallow"] == 0)
-        & (play_reads["width_spread"] > 15)
-        & (play_reads["depth_min"] > 12)
-    )
-    play_reads["condensed_deep"] = (
-        (play_reads["n_deep"] >= 2)
-        & (play_reads["width_spread"] < 8)
-        & (play_reads["depth_min"] > 10)
-    )
-
-    # Merge with actual outcome
-    play_reads = play_reads.merge(
-        labels[["game_id", "play_id", "disguised", "shell_changed",
-                "any_hash_cross", "any_drove_forward", "any_bailed_deep"]],
-        on=["game_id", "play_id"], how="left",
-    )
-    play_reads = play_reads.merge(
-        shells[["game_id", "play_id", "throw_shell"]],
-        on=["game_id", "play_id"], how="left", suffixes=("", "_actual"),
-    )
-
-    return play_reads
+    snap_frames.columns = ["game_id", "play_id", "snap_frame"]
+    return snap_frames
 
 
-def qb_read_decision_tree(play_reads):
+def pos_group(pos):
+    if pos in ("CB",):
+        return "CB"
+    if pos in ("FS", "SS", "S"):
+        return "Safety"
+    if pos in ("ILB", "OLB", "MLB", "LB"):
+        return "LB"
+    return "Other"
+
+
+def build_matchup_data(input_df, frame_refs, snap_frames):
     """
-    Build the QB's pre-snap read decision tree.
-    Outputs: which reads to trust, which to question.
+    For each play, determine:
+      - Who is nearest defender to target at SNAP (QB can see this)
+      - Who is nearest defender to target at THROW (actual coverage)
+      - Separation at throw (throw window quality)
     """
-    print("\n" + "=" * 60)
-    print("QB PRE-SNAP READ CHEAT SHEET")
-    print("=" * 60)
+    print("Building matchup data...")
 
-    baseline = play_reads["disguised"].mean()
+    # Target at throw
+    target_throw = input_df[input_df["player_role"] == "Targeted Receiver"].merge(
+        frame_refs[["game_id", "play_id", "throw_frame"]], on=["game_id", "play_id"]
+    )
+    target_throw = target_throw[target_throw["frame_id"] == target_throw["throw_frame"]]
 
-    reads = [
-        ("TRUST: Classic 2-High Split",
-         play_reads["honest_2high"],
-         "Both safeties deep (>12 yds), split wide (>15 yds)"),
-        ("SUSPICIOUS: One Shallow + One Deep",
-         play_reads["one_shallow_one_deep"],
-         "2-high look but one safety <8 yds from LOS"),
-        ("SUSPICIOUS: Safeties Stacked",
-         play_reads["stacked"],
-         "Different depths + narrow width (<10 yds)"),
-        ("SUSPICIOUS: Both Near Hash",
-         play_reads["both_near_hash"],
-         "Both safeties within 3 yds of hash marks"),
-        ("CAUTION: Condensed Deep",
-         play_reads["condensed_deep"],
-         "Both deep but tight together (<8 yds width)"),
-    ]
+    # All defenders at throw
+    def_throw = input_df[input_df["player_side"] == "Defense"].merge(
+        frame_refs[["game_id", "play_id", "throw_frame"]], on=["game_id", "play_id"]
+    )
+    def_throw = def_throw[def_throw["frame_id"] == def_throw["throw_frame"]]
 
-    print(f"\n  Baseline disguise rate: {baseline*100:.1f}%")
-    print(f"  {'':3s}{'Read':50s} {'Rate':>6s} {'Plays':>7s} {'vs Base':>8s}")
-    print("  " + "-" * 78)
+    # Target at snap
+    target_snap = input_df[input_df["player_role"] == "Targeted Receiver"].merge(
+        snap_frames, on=["game_id", "play_id"]
+    )
+    target_snap = target_snap[target_snap["frame_id"] == target_snap["snap_frame"]]
 
-    for label, mask, desc in reads:
-        if mask.sum() >= 30:
-            rate = play_reads.loc[mask, "disguised"].mean()
-            n = mask.sum()
-            vs_base = rate - baseline
-            flag = "!!" if abs(vs_base) > 0.05 else "  "
-            print(f"  {flag}{label:50s} {rate*100:>5.1f}% {n:>6,}  {vs_base*100:>+6.1f}%")
-            print(f"     {desc}")
-            print()
+    # All defenders at snap
+    def_snap = input_df[input_df["player_side"] == "Defense"].merge(
+        snap_frames, on=["game_id", "play_id"]
+    )
+    def_snap = def_snap[def_snap["frame_id"] == def_snap["snap_frame"]]
 
-    print("  BOTTOM LINE FOR THE QB:")
-    print("  " + "-" * 50)
-    print("  1. Classic 2-high split → TRUST IT (7.6% disguise)")
-    print("  2. One safety shallow → BE ALERT (34.1% disguise)")
-    print("  3. Safeties stacked → EXPECT ROTATION (28.5%)")
-    print("  4. 1-high looks → MOST DANGEROUS (37.7% disguise)")
-    print("  5. Safety near hash → CHECK POST-SNAP (22.6%)")
+    results = []
+    for _, tgt_t in target_throw.iterrows():
+        gid, pid = tgt_t.game_id, tgt_t.play_id
 
-
-def qb_timing_analysis(input_df, frame_refs, labels):
-    """
-    When can the QB detect rotation? Frame-by-frame analysis.
-    """
-    print("\n" + "=" * 60)
-    print("ROTATION DETECTION TIMING")
-    print("=" * 60)
-    print("  How early does the disguise become visible?\n")
-
-    safety_df = input_df[input_df["is_safety"]].copy()
-    snap_safety = safety_df[safety_df["frame_id"] == 1]
-    snap_pos = snap_safety.set_index(
-        ["game_id", "play_id", "nfl_id"]
-    )[["x", "y"]].rename(columns={"x": "snap_x", "y": "snap_y"})
-
-    timing_data = []
-
-    for sec_before in [2.5, 2.0, 1.5, 1.0, 0.5]:
-        frames_before = int(sec_before * 10)
-
-        check = safety_df.merge(
-            frame_refs[["game_id", "play_id", "throw_frame"]],
-            on=["game_id", "play_id"],
-        )
-        target_frame = (check["throw_frame"] - frames_before).clip(lower=1)
-        check = check[check["frame_id"] == target_frame]
-
-        check_pos = check.set_index(
-            ["game_id", "play_id", "nfl_id"]
-        )[["x", "y"]].rename(columns={"x": "chk_x", "y": "chk_y"})
-
-        common = snap_pos.index.intersection(check_pos.index)
-        if len(common) == 0:
+        # Nearest defender at throw
+        play_def_t = def_throw[(def_throw.game_id == gid) & (def_throw.play_id == pid)]
+        if len(play_def_t) == 0:
             continue
-
-        disp = np.sqrt(
-            (check_pos.loc[common, "chk_x"] - snap_pos.loc[common, "snap_x"])**2
-            + (check_pos.loc[common, "chk_y"] - snap_pos.loc[common, "snap_y"])**2
+        dists_t = np.sqrt(
+            (play_def_t.x.values - tgt_t.x) ** 2 + (play_def_t.y.values - tgt_t.y) ** 2
         )
+        nearest_t = play_def_t.iloc[dists_t.argmin()]
 
-        play_disp = disp.reset_index().groupby(["game_id", "play_id"])[0].max().reset_index()
-        play_disp.columns = ["game_id", "play_id", "max_disp"]
-        play_disp = play_disp.merge(
-            labels[["game_id", "play_id", "disguised"]],
-            on=["game_id", "play_id"], how="left",
+        # Nearest defender at snap
+        tgt_s = target_snap[(target_snap.game_id == gid) & (target_snap.play_id == pid)]
+        play_def_s = def_snap[(def_snap.game_id == gid) & (def_snap.play_id == pid)]
+        if len(tgt_s) == 0 or len(play_def_s) == 0:
+            continue
+        tgt_s = tgt_s.iloc[0]
+        dists_s = np.sqrt(
+            (play_def_s.x.values - tgt_s.x) ** 2 + (play_def_s.y.values - tgt_s.y) ** 2
         )
+        nearest_s = play_def_s.iloc[dists_s.argmin()]
 
-        d_mean = play_disp[play_disp["disguised"]]["max_disp"].mean()
-        c_mean = play_disp[~play_disp["disguised"]]["max_disp"].mean()
-        gap = d_mean - c_mean
+        # CB leverage at snap (for the nearest CB, not just nearest defender)
+        play_cbs_s = play_def_s[play_def_s.player_position == "CB"]
+        cb_leverage = "no_cb"
+        cb_cushion = "no_cb"
+        cb_dist = np.nan
+        if len(play_cbs_s) > 0:
+            cb_dists = np.sqrt(
+                (play_cbs_s.x.values - tgt_s.x) ** 2 + (play_cbs_s.y.values - tgt_s.y) ** 2
+            )
+            nearest_cb = play_cbs_s.iloc[cb_dists.argmin()]
+            cb_dist = cb_dists.min()
 
-        timing_data.append({
-            "seconds_before_throw": sec_before,
-            "disguised_disp": d_mean,
-            "clean_disp": c_mean,
-            "gap": gap,
+            # Leverage
+            y_diff = nearest_cb.y - tgt_s.y
+            if tgt_s.y > 26.65:
+                cb_leverage = "inside" if y_diff < -1.5 else ("outside" if y_diff > 1.5 else "head_up")
+            else:
+                cb_leverage = "inside" if y_diff > 1.5 else ("outside" if y_diff < -1.5 else "head_up")
+
+            # Cushion
+            x_diff = nearest_cb.x - tgt_s.x
+            if x_diff > 5:
+                cb_cushion = "off"
+            elif x_diff > 2:
+                cb_cushion = "soft"
+            else:
+                cb_cushion = "press"
+
+        results.append({
+            "game_id": gid,
+            "play_id": pid,
+            "target_pos": tgt_t.player_position,
+            "target_name": tgt_t.player_name,
+            # At throw
+            "throw_def_pos": nearest_t.player_position,
+            "throw_def_group": pos_group(nearest_t.player_position),
+            "separation": dists_t.min(),
+            # At snap
+            "snap_def_pos": nearest_s.player_position,
+            "snap_def_group": pos_group(nearest_s.player_position),
+            "snap_def_dist": dists_s.min(),
+            "snap_def_speed": nearest_s.s,
+            # CB leverage
+            "cb_leverage": cb_leverage,
+            "cb_cushion": cb_cushion,
+            "cb_dist": cb_dist,
+            # Same defender?
+            "same_defender": nearest_s.nfl_id == nearest_t.nfl_id,
         })
 
-        print(f"  {sec_before:.1f}s before throw:")
-        print(f"    Disguised plays: safety moved {d_mean:.2f} yds from snap")
-        print(f"    Clean plays:     safety moved {c_mean:.2f} yds from snap")
-        print(f"    --> Gap: {gap:.2f} yds (bigger = easier to detect)")
-        print()
-
-    print("  QB TIMING TAKEAWAY:")
-    print("  " + "-" * 50)
-    print("  At 2.0s pre-throw, disguise signal is faint (~0.5 yd gap)")
-    print("  At 1.0s pre-throw, the gap doubles — this is your read window")
-    print("  By 0.5s, it's too late for a QB to change the play")
-    print("  --> The optimal QB read window is 1.0-1.5s pre-throw")
-
-    return pd.DataFrame(timing_data)
-
-
-def plot_qb_read_heatmap(play_reads, save_path=None):
-    """
-    Heat map of disguise probability by safety depth x width.
-    This is the QB's "cheat sheet" visualization.
-    """
-    fig, ax = plt.subplots(figsize=(10, 8))
-
-    # Bin depth and width
-    play_reads = play_reads.copy()
-    play_reads["depth_bin"] = pd.cut(
-        play_reads["depth_min"], bins=[0, 5, 8, 10, 12, 15, 25],
-        labels=["0-5", "5-8", "8-10", "10-12", "12-15", "15+"],
-    )
-    play_reads["width_bin"] = pd.cut(
-        play_reads["width_spread"], bins=[0, 5, 10, 15, 20, 50],
-        labels=["0-5", "5-10", "10-15", "15-20", "20+"],
+    df = pd.DataFrame(results)
+    df["target_group"] = df["target_pos"].apply(
+        lambda x: "WR" if x == "WR" else ("TE" if x == "TE" else "RB")
     )
 
-    # Pivot table: disguise rate
-    pivot = play_reads.groupby(["depth_bin", "width_bin"], observed=True).agg(
-        disguise_rate=("disguised", "mean"),
-        n_plays=("play_id", "count"),
-    ).reset_index()
-
-    heatmap_data = pivot.pivot(
-        index="depth_bin", columns="width_bin", values="disguise_rate"
-    )
-    counts_data = pivot.pivot(
-        index="depth_bin", columns="width_bin", values="n_plays"
-    )
-
-    # Custom colormap: green (safe) to red (danger)
-    cmap = LinearSegmentedColormap.from_list(
-        "qb_read", ["#27ae60", "#f1c40f", "#e74c3c"]
-    )
-
-    sns.heatmap(
-        heatmap_data * 100, annot=True, fmt=".0f", cmap=cmap,
-        ax=ax, vmin=5, vmax=40, linewidths=1, linecolor="white",
-        cbar_kws={"label": "Disguise Rate (%)"},
-    )
-
-    # Add play counts as secondary annotation
-    for i, row_label in enumerate(heatmap_data.index):
-        for j, col_label in enumerate(heatmap_data.columns):
-            count = counts_data.iloc[i, j] if not pd.isna(counts_data.iloc[i, j]) else 0
-            if count > 0:
-                ax.text(j + 0.5, i + 0.75, f"n={int(count)}", ha="center", va="center",
-                        fontsize=7, color="gray", alpha=0.7)
-
-    ax.set_xlabel("Safety Width Spread (yards)", fontsize=12)
-    ax.set_ylabel("Shallowest Safety Depth from LOS (yards)", fontsize=12)
-    ax.set_title(
-        "QB Pre-Snap Cheat Sheet: Disguise Probability\n"
-        "by Safety Depth x Width Spread at Snap",
-        fontsize=14, fontweight="bold", pad=15,
-    )
-
-    # Annotate zones
-    ax.text(0.02, 0.02, "GREEN = Trust the look\nRED = Expect rotation",
-            transform=ax.transAxes, fontsize=9, va="bottom",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
-
-    plt.tight_layout()
-    if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"  Saved: {save_path}")
-    plt.close()
-    return fig
+    print(f"  Built matchup data for {len(df):,} plays")
+    return df
 
 
-def plot_timing_chart(timing_df, save_path=None):
-    """Plot the rotation detection timing analysis."""
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    x = timing_df["seconds_before_throw"]
-    ax.plot(x, timing_df["disguised_disp"], "o-", color="#e74c3c",
-            linewidth=2.5, markersize=10, label="Disguised Plays", zorder=5)
-    ax.plot(x, timing_df["clean_disp"], "o-", color="#95a5a6",
-            linewidth=2.5, markersize=10, label="Clean Plays", zorder=5)
-
-    # Shade the gap
-    ax.fill_between(x, timing_df["disguised_disp"], timing_df["clean_disp"],
-                    alpha=0.15, color="#e74c3c")
-
-    # Annotate the read window
-    ax.axvspan(1.0, 1.5, alpha=0.1, color="#3498db",
-               label="Optimal QB Read Window")
-    ax.text(1.25, ax.get_ylim()[1] * 0.9, "QB Read\nWindow",
-            ha="center", fontsize=10, color="#2c3e50", fontweight="bold",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="#3498db", alpha=0.2))
-
-    ax.set_xlabel("Seconds Before Throw", fontsize=12)
-    ax.set_ylabel("Max Safety Displacement from Snap (yards)", fontsize=12)
-    ax.set_title("When Does Disguise Become Detectable?\n"
-                 "Safety movement gap between disguised and clean plays",
-                 fontsize=14, fontweight="bold", pad=15)
-    ax.legend(fontsize=10)
-    ax.invert_xaxis()
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"  Saved: {save_path}")
-    plt.close()
-    return fig
-
-
-def plot_shell_trust_chart(play_reads, save_path=None):
-    """
-    Bar chart: Which pre-snap looks can you trust?
-    Sorted by disguise rate.
-    """
-    fig, ax = plt.subplots(figsize=(12, 6))
-
-    reads = {
-        "Classic 2-High\n(deep + wide)": play_reads["honest_2high"],
-        "Standard\n2-High": play_reads["snap_shell"] == "2-high",
-        "Overall\nBaseline": pd.Series(True, index=play_reads.index),
-        "Both Near\nHash": play_reads["both_near_hash"],
-        "Condensed\nDeep": play_reads["condensed_deep"],
-        "Safeties\nStacked": play_reads["stacked"],
-        "One Shallow\n+ One Deep": play_reads["one_shallow_one_deep"],
-        "1-High\nShell": play_reads["snap_shell"] == "1-high",
-        "0-High\nShell": play_reads["snap_shell"] == "0-high",
-    }
-
-    labels_list = []
-    rates = []
-    counts = []
-    for label, mask in reads.items():
-        if mask.sum() >= 30:
-            rate = play_reads.loc[mask, "disguised"].mean()
-            labels_list.append(label)
-            rates.append(rate * 100)
-            counts.append(mask.sum())
-
-    # Sort by rate
-    sorted_idx = np.argsort(rates)
-    labels_sorted = [labels_list[i] for i in sorted_idx]
-    rates_sorted = [rates[i] for i in sorted_idx]
-    counts_sorted = [counts[i] for i in sorted_idx]
-
-    # Colors: green to red gradient
-    colors = [plt.cm.RdYlGn_r(r / max(rates_sorted)) for r in rates_sorted]
-
-    bars = ax.barh(range(len(labels_sorted)), rates_sorted, color=colors,
-                   edgecolor="white", height=0.7)
-
-    for i, (rate, count) in enumerate(zip(rates_sorted, counts_sorted)):
-        ax.text(rate + 0.5, i, f"{rate:.1f}%  ({count:,} plays)",
-                va="center", fontsize=9, fontweight="bold")
-
-    ax.set_yticks(range(len(labels_sorted)))
-    ax.set_yticklabels(labels_sorted, fontsize=10)
-    ax.set_xlabel("Disguise Rate (%)", fontsize=12)
-    ax.set_title("QB Trust Chart: How Often Does Each Pre-Snap Look Lie?",
-                 fontsize=14, fontweight="bold", pad=15)
-
-    # Reference line at baseline
-    baseline = play_reads["disguised"].mean() * 100
-    ax.axvline(x=baseline, color="gray", linestyle="--", alpha=0.7, linewidth=1.5)
-    ax.text(baseline + 0.3, len(labels_sorted) - 0.5, f"Baseline\n{baseline:.1f}%",
-            fontsize=8, color="gray")
-
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-
-    plt.tight_layout()
-    if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"  Saved: {save_path}")
-    plt.close()
-    return fig
-
-
-def generate_qb_report(play_reads, timing_df):
-    """Generate the final QB-facing report."""
+def analyze_matchup_prediction(matchup_df):
+    """Can the QB predict who covers the target from pre-snap alignment?"""
     print("\n" + "=" * 60)
-    print("QB GAME-PLAN REPORT: Reading Coverage Disguise")
+    print("MATCHUP PREDICTION: Can you tell pre-snap who covers your guy?")
     print("=" * 60)
 
-    total = len(play_reads)
-    baseline = play_reads["disguised"].mean()
+    print(f"\n  Overall: nearest defender at snap = nearest at throw "
+          f"{matchup_df.same_defender.mean()*100:.1f}% of the time")
+
+    print(f"\n  By pre-snap nearest position:")
+    for sg in ["CB", "Safety", "LB"]:
+        data = matchup_df[matchup_df.snap_def_group == sg]
+        if len(data) < 50:
+            continue
+        rate = data.same_defender.mean()
+        avg_sep = data.separation.mean()
+        # Who actually covers at throw?
+        throw_dist = data.throw_def_group.value_counts(normalize=True).head(3)
+        throw_str = ", ".join(f"{k} {v*100:.0f}%" for k, v in throw_dist.items())
+        print(f"    {sg:7s} at snap → same at throw {rate*100:.0f}% | "
+              f"avg separation {avg_sep:.1f} yds | ends up: {throw_str}")
+
+    print(f"\n  KEY INSIGHT FOR QB:")
+    cb_data = matchup_df[matchup_df.snap_def_group == "CB"]
+    lb_data = matchup_df[matchup_df.snap_def_group == "LB"]
+    if len(cb_data) > 0 and len(lb_data) > 0:
+        print(f"    CB on your target at snap → {cb_data.separation.mean():.1f} yd window at throw")
+        print(f"    LB on your target at snap → {lb_data.separation.mean():.1f} yd window at throw")
+        print(f"    That's +{lb_data.separation.mean() - cb_data.separation.mean():.1f} yards of extra separation.")
+        print(f"    When a LB is covering your target, ATTACK IT.")
+
+
+def analyze_throw_windows(matchup_df):
+    """What pre-snap alignment predicts the throw window?"""
+    print("\n" + "=" * 60)
+    print("THROW WINDOW PREDICTION: What does alignment tell you?")
+    print("=" * 60)
+
+    # CB cushion → throw window
+    cb_plays = matchup_df[matchup_df.cb_cushion != "no_cb"]
+    print(f"\n  CB Cushion at Snap → Throw Window:")
+    for cushion in ["press", "soft", "off"]:
+        data = cb_plays[cb_plays.cb_cushion == cushion]
+        if len(data) >= 30:
+            print(f"    {cushion:6s}: {data.separation.mean():.2f} yds avg, "
+                  f"tight(<3) {(data.separation<3).mean()*100:.0f}%, "
+                  f"open(>5) {(data.separation>5).mean()*100:.0f}% "
+                  f"({len(data):,} plays)")
+
+    # CB leverage → throw window
+    print(f"\n  CB Leverage at Snap → Throw Window:")
+    for lev in ["inside", "head_up", "outside"]:
+        data = cb_plays[cb_plays.cb_leverage == lev]
+        if len(data) >= 30:
+            print(f"    {lev:8s}: {data.separation.mean():.2f} yds avg, "
+                  f"tight(<3) {(data.separation<3).mean()*100:.0f}%, "
+                  f"open(>5) {(data.separation>5).mean()*100:.0f}% "
+                  f"({len(data):,} plays)")
+
+    # Cushion + leverage combo
+    print(f"\n  CB Cushion x Leverage → Throw Window (avg separation):")
+    pivot = cb_plays.groupby(["cb_cushion", "cb_leverage"])["separation"].agg(["mean", "count"]).reset_index()
+    for _, row in pivot[pivot["count"] >= 30].sort_values("mean").iterrows():
+        print(f"    {row.cb_cushion:6s} + {row.cb_leverage:8s}: "
+              f"{row['mean']:.2f} yds ({int(row['count']):,} plays)")
+
+
+def analyze_mismatches(matchup_df):
+    """Which matchup types produce the biggest windows?"""
+    print("\n" + "=" * 60)
+    print("MISMATCH EXPLOITATION: Where are the windows?")
+    print("=" * 60)
+
+    for tgt in ["WR", "TE", "RB"]:
+        tgt_data = matchup_df[matchup_df.target_group == tgt]
+        if len(tgt_data) < 50:
+            continue
+        print(f"\n  {tgt} targeted ({len(tgt_data):,} plays):")
+        for dg in ["CB", "Safety", "LB"]:
+            dg_data = tgt_data[tgt_data.throw_def_group == dg]
+            if len(dg_data) >= 20:
+                print(f"    vs {dg:7s}: {dg_data.separation.mean():.2f} yds | "
+                      f"tight {(dg_data.separation<3).mean()*100:.0f}% | "
+                      f"open {(dg_data.separation>5).mean()*100:.0f}% | "
+                      f"{len(dg_data):,} plays")
+
+    print(f"\n  TOP MISMATCHES (by avg separation):")
+    combos = matchup_df.groupby(["target_group", "throw_def_group"]).agg(
+        separation=("separation", "mean"),
+        n=("play_id", "count"),
+    ).reset_index()
+    combos = combos[combos.n >= 30].sort_values("separation", ascending=False)
+    for _, row in combos.head(8).iterrows():
+        print(f"    {row.target_group} vs {row.throw_def_group}: "
+              f"{row.separation:.2f} yds ({int(row.n):,} plays)")
+
+
+def plot_throw_window_chart(matchup_df, save_path=None):
+    """Visualize throw windows by matchup type."""
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+    # 1. Separation by defender type
+    ax = axes[0]
+    for i, dg in enumerate(["CB", "Safety", "LB"]):
+        data = matchup_df[matchup_df.throw_def_group == dg]["separation"]
+        if len(data) < 30:
+            continue
+        color = ["#e74c3c", "#f39c12", "#2ecc71"][i]
+        ax.hist(data, bins=30, alpha=0.5, color=color, label=f"{dg} ({len(data):,})",
+                density=True, range=(0, 15))
+    ax.axvline(x=3, color="gray", linestyle="--", alpha=0.5)
+    ax.text(3.1, ax.get_ylim()[1] * 0.9, "Tight\nwindow", fontsize=8, color="gray")
+    ax.set_xlabel("Separation at Throw (yards)")
+    ax.set_ylabel("Density")
+    ax.set_title("Throw Window by Covering Defender", fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    # 2. CB Cushion → Separation
+    ax = axes[1]
+    cb_plays = matchup_df[matchup_df.cb_cushion.isin(["press", "soft", "off"])]
+    cushion_order = ["press", "soft", "off"]
+    cushion_colors = ["#e74c3c", "#f39c12", "#2ecc71"]
+    positions = []
+    for i, c in enumerate(cushion_order):
+        data = cb_plays[cb_plays.cb_cushion == c]["separation"]
+        if len(data) < 30:
+            continue
+        bp = ax.boxplot([data], positions=[i], widths=0.6, patch_artist=True,
+                        showfliers=False, medianprops=dict(color="black", linewidth=2))
+        bp["boxes"][0].set_facecolor(cushion_colors[i])
+        bp["boxes"][0].set_alpha(0.7)
+        ax.text(i, data.mean() + 0.3, f"{data.mean():.1f}", ha="center",
+                fontsize=10, fontweight="bold")
+    ax.set_xticks(range(len(cushion_order)))
+    ax.set_xticklabels(["Press\n(0-2 yds)", "Soft\n(2-5 yds)", "Off\n(5+ yds)"])
+    ax.set_ylabel("Separation at Throw (yards)")
+    ax.set_title("CB Cushion at Snap → Throw Window", fontweight="bold")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    # 3. Mismatch chart
+    ax = axes[2]
+    combos = matchup_df.groupby(["target_group", "throw_def_group"]).agg(
+        sep=("separation", "mean"), n=("play_id", "count")
+    ).reset_index()
+    combos = combos[combos.n >= 30].sort_values("sep")
+    colors = {"CB": "#e74c3c", "Safety": "#f39c12", "LB": "#2ecc71"}
+    bars = ax.barh(
+        range(len(combos)),
+        combos["sep"],
+        color=[colors.get(r.throw_def_group, "#95a5a6") for _, r in combos.iterrows()],
+        edgecolor="white",
+    )
+    ax.set_yticks(range(len(combos)))
+    ax.set_yticklabels(
+        [f"{r.target_group} vs {r.throw_def_group}" for _, r in combos.iterrows()],
+        fontsize=9,
+    )
+    for i, (_, r) in enumerate(combos.iterrows()):
+        ax.text(r.sep + 0.1, i, f"{r.sep:.1f} yds ({int(r.n):,})",
+                va="center", fontsize=8)
+    ax.set_xlabel("Avg Separation at Throw (yards)")
+    ax.set_title("Matchup Separation Rankings", fontweight="bold")
+    ax.axvline(x=3, color="gray", linestyle="--", alpha=0.3)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    plt.suptitle("QB Throw Window Analysis — NFL 2023-2024",
+                 fontsize=15, fontweight="bold", y=1.02)
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"  Saved: {save_path}")
+    plt.close()
+    return fig
+
+
+def plot_pre_snap_window_heatmap(matchup_df, save_path=None):
+    """Heatmap: snap nearest position x CB cushion → throw window."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    df = matchup_df[matchup_df.cb_cushion.isin(["press", "soft", "off"])].copy()
+
+    pivot = df.groupby(["snap_def_group", "cb_cushion"]).agg(
+        sep=("separation", "mean"), n=("play_id", "count")
+    ).reset_index()
+    pivot_table = pivot.pivot(index="snap_def_group", columns="cb_cushion", values="sep")
+    count_table = pivot.pivot(index="snap_def_group", columns="cb_cushion", values="n")
+
+    # Reorder
+    row_order = ["CB", "Safety", "LB"]
+    col_order = ["press", "soft", "off"]
+    pivot_table = pivot_table.reindex(index=row_order, columns=col_order)
+    count_table = count_table.reindex(index=row_order, columns=col_order)
+
+    from matplotlib.colors import LinearSegmentedColormap
+    cmap = LinearSegmentedColormap.from_list("window", ["#e74c3c", "#f1c40f", "#2ecc71"])
+
+    sns.heatmap(pivot_table, annot=True, fmt=".1f", cmap=cmap, ax=ax,
+                vmin=2.5, vmax=7, linewidths=2, linecolor="white",
+                cbar_kws={"label": "Avg Separation (yds)"})
+
+    # Add counts
+    for i in range(len(row_order)):
+        for j in range(len(col_order)):
+            val = count_table.iloc[i, j] if not pd.isna(count_table.iloc[i, j]) else 0
+            if val > 0:
+                ax.text(j + 0.5, i + 0.75, f"n={int(val)}", ha="center", va="center",
+                        fontsize=8, color="gray")
+
+    ax.set_xlabel("CB Cushion at Snap", fontsize=12)
+    ax.set_ylabel("Nearest Defender at Snap", fontsize=12)
+    ax.set_title("QB Pre-Snap Read: Throw Window Prediction\n"
+                 "Nearest defender type x CB cushion → target separation at throw",
+                 fontsize=13, fontweight="bold", pad=15)
+    ax.set_xticklabels(["Press\n(0-2 yds)", "Soft\n(2-5 yds)", "Off\n(5+ yds)"])
+
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"  Saved: {save_path}")
+    plt.close()
+    return fig
+
+
+def generate_qb_gameplan(matchup_df):
+    """Generate the final QB game-plan report."""
+    print("\n" + "=" * 60)
+    print("QB GAME-PLAN BINDER: Pre-Snap Read Guide")
+    print("=" * 60)
+
+    cb = matchup_df[matchup_df.snap_def_group == "CB"]
+    lb = matchup_df[matchup_df.snap_def_group == "LB"]
+    sf = matchup_df[matchup_df.snap_def_group == "Safety"]
+    press = matchup_df[matchup_df.cb_cushion == "press"]
+    off = matchup_df[matchup_df.cb_cushion == "off"]
+    wr_lb = matchup_df[(matchup_df.target_group == "WR") & (matchup_df.throw_def_group == "LB")]
+    wr_cb = matchup_df[(matchup_df.target_group == "WR") & (matchup_df.throw_def_group == "CB")]
 
     print(f"""
-  SITUATION OVERVIEW
+  READ 1: WHO IS ON YOUR TARGET?
   {'='*50}
-  Across {total:,} pass plays (NFL 2023-2024):
-  - 17.6% of defensive looks involve some form of disguise
-  - That means ~1 in 6 plays, what you see is NOT what you get
+  The nearest defender at snap stays on the target:
+    CB at snap  → 65% stays, avg {cb.separation.mean():.1f} yd window
+    Safety      → 57% stays, avg {sf.separation.mean():.1f} yd window
+    LB          → 63% stays, avg {lb.separation.mean():.1f} yd window
 
-  YOUR PRE-SNAP READS (from safest to most dangerous)
+  RULE: If a LB is covering your primary target pre-snap,
+  that's +{lb.separation.mean() - cb.separation.mean():.1f} yards of extra separation.
+  Identify it. Attack it.
+
+  READ 2: CB CUSHION TELLS YOU THE WINDOW
   {'='*50}
+  Press (0-2 yds): {press.separation.mean():.1f} yd window — tight. Need a route win.
+    Tight coverage rate: {(press.separation < 3).mean()*100:.0f}%
+  Off (5+ yds):    {off.separation.mean():.1f} yd window — room to operate.
+    Open rate: {(off.separation > 5).mean()*100:.0f}%
 
-  SAFE (Trust the look):
-    Classic 2-high split (both deep + wide apart):
-    --> Only 7.6% disguise. This is the honest look.
-    --> If you see safeties >12 yds deep AND >15 yds apart,
-        the coverage is almost certainly what it looks like.
+  RULE: Off coverage = guaranteed short throw window.
+  Press = contested. Only attack press with quick releases.
 
-  CAUTION (Verify post-snap):
-    Standard 2-high (anything that looks like 2 deep):
-    --> 12.7% disguise. Usually honest, but check edges.
-    --> Look for: safety leaning toward hash, speed at snap.
-
-  ALERT (Expect rotation):
-    One safety shallow + one deep:
-    --> 34.1% disguise. 1 in 3 plays, something changes.
-    --> The shallow safety is the rotation player. Watch him.
-
-    Safeties stacked (different depths, close together):
-    --> 28.5% disguise. This is a rotation look.
-    --> Usually becomes robber or Cover-3 bracket.
-
-    Both safeties near the hash:
-    --> 24.3% disguise. Hash proximity = rotation staging.
-
-  DANGER (High deception):
-    1-high shell:
-    --> 37.7% disguise. Over 1 in 3 plays rotate.
-    --> The single-high safety often bails to a half.
-
-    0-high shell:
-    --> 42.8% disguise. Highest deception rate.
-    --> Usually a blitz look that transforms.
-
-  YOUR POST-SNAP READ WINDOW
+  READ 3: THE MISMATCH HIERARCHY
   {'='*50}
-  You have about 1.0-1.5 seconds after the snap to detect
-  safety rotation before you commit to a throw.
+  Best windows (highest avg separation):
+    RB vs any defender:  7-9 yds — the checkdown is ALWAYS open
+    WR vs LB:           {wr_lb.separation.mean():.1f} yds — attack every time
+    WR vs Safety:       {matchup_df[(matchup_df.target_group=='WR') & (matchup_df.throw_def_group=='Safety')].separation.mean():.1f} yds
+    WR vs CB:           {wr_cb.separation.mean():.1f} yds — tightest windows
 
-  At 2.0s pre-throw: disguise signal is faint (0.5 yd gap)
-  At 1.5s pre-throw: gap doubles — this is your alert point
-  At 1.0s pre-throw: clear separation — make your decision now
-  At 0.5s pre-throw: too late to change the play
+  RULE: When you identify a LB on a WR pre-snap, that's your
+  first read. LBs give up {wr_lb.separation.mean() - wr_cb.separation.mean():.1f} more yards of separation than CBs.
 
-  --> The optimal read window is 1.0-1.5 seconds post-snap
-  --> Focus on the SHALLOWEST safety's first two steps
-
-  ACTIONABLE RULES
+  READ 4: WHEN THE MATCHUP CHANGES
   {'='*50}
-  RULE 1: Both safeties deep + split = TRUST. Run your play.
-  RULE 2: Staggered depth = SUSPECT. Scan for rotation post-snap.
-  RULE 3: 1-high = expect the unexpected. Have a hot read.
-  RULE 4: Hash proximity = rotation staging ground. Be ready.
-  RULE 5: Speed at snap is a late tell — if a safety is already
-          moving, the rotation is underway.
+  43% of the time, the pre-snap nearest defender is NOT the
+  one covering at throw. When the coverage SWITCHES:
+    New defender is further away → bigger window
+    Avg separation: {matchup_df[~matchup_df.same_defender].separation.mean():.1f} yds (switched)
+    vs {matchup_df[matchup_df.same_defender].separation.mean():.1f} yds (same defender)
+
+  RULE: Coverage switches = bigger windows. If you see the
+  defense rotate post-snap, the receiver may be more open
+  than the pre-snap look suggests.
 """)
 
 
@@ -472,24 +454,25 @@ if __name__ == "__main__":
     print("=" * 60)
 
     input_df = pd.read_pickle("data/input_processed.pkl")
+    output_df = pd.read_pickle("data/output_processed.pkl")
     frame_refs = pd.read_pickle("data/frame_refs.pkl")
-    labels = pd.read_pickle("data/disguise_labels.pkl")
-    shells = pd.read_pickle("data/shells.pkl")
 
-    # Build QB read features
-    play_reads = build_qb_read_features(input_df, frame_refs, labels, shells)
+    # Detect snaps
+    snap_frames = detect_snap_frames(input_df)
 
-    # Decision tree analysis
-    qb_read_decision_tree(play_reads)
+    # Build matchup data
+    matchup_df = build_matchup_data(input_df, frame_refs, snap_frames)
+    matchup_df.to_pickle("data/matchup_data.pkl")
 
-    # Timing analysis
-    timing_df = qb_timing_analysis(input_df, frame_refs, labels)
+    # Analyses
+    analyze_matchup_prediction(matchup_df)
+    analyze_throw_windows(matchup_df)
+    analyze_mismatches(matchup_df)
 
     # Visualizations
     print("\nGenerating QB visualizations...")
-    plot_qb_read_heatmap(play_reads, "output/figures/qb_read_heatmap.png")
-    plot_timing_chart(timing_df, "output/figures/qb_timing_chart.png")
-    plot_shell_trust_chart(play_reads, "output/figures/qb_trust_chart.png")
+    plot_throw_window_chart(matchup_df, "output/figures/qb_throw_windows.png")
+    plot_pre_snap_window_heatmap(matchup_df, "output/figures/qb_presnap_heatmap.png")
 
-    # Final report
-    generate_qb_report(play_reads, timing_df)
+    # Game plan
+    generate_qb_gameplan(matchup_df)
