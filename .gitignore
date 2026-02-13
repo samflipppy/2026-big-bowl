@@ -3,6 +3,7 @@ data/serialized_data/
 data/*.pkl
 data/*.zip
 data/raw/
+data/2025/
 
 # Python
 __pycache__/
